@@ -9,9 +9,10 @@ source = Path('Sources/main.swift').read_text().rsplit('\nlet app = NSApplicatio
 source += '''
 extension AppDelegate {
     func checkSwitchContinuity() -> Bool {
-        enabled = true; trusted = true; awake = true; pid = -1
+        enabled = true; trusted = true; awake = true; pid = -1; hoverEnabled = false
+        reading = true // Hold the AX query to exercise the entire pending handoff.
         guard let screen = NSScreen.screens.first else { print("FAIL: no display"); return false }
-        let frame = CGRect(x: screen.frame.minX, y: 0, width: 400, height: 32)
+        let frame = CGRect(x: screen.frame.minX, y: 0, width: 900, height: 32)
         measurement = MenuMeasurement(pid: -1, frame: frame, tracking: false, count: 7)
         measuredAt = Date()
         applyGeometry(measurement!)
@@ -19,23 +20,66 @@ extension AppDelegate {
         guard let original = covers.first else { print("FAIL: no initial cover"); return false }
         original.alphaValue = 1
         let before = original.isVisible && original.targetAlpha == 1
-        guard let nextApp = NSWorkspace.shared.frontmostApplication else { return false }
-        widthCache[cacheKey(for: nextApp.processIdentifier, screen: screen)] = 550
+        guard NSWorkspace.shared.frontmostApplication != nil else { return false }
         frontChanged()
-        let cached = original.frame.width == 550
+        // The next app's 850-point menu must stay covered while a slow read
+        // for another app is in flight, even if an early sample is shorter.
+        let cached = original.frame.width >= 856
         let during = covers.first === original && original.isVisible && original.targetAlpha == 1
         print(before ? "PASS initial cover visible" : "FAIL initial cover not visible")
         print(during ? "PASS app switch retains the visible panel" : "FAIL app switch destroys or hides the cover")
-        print(cached ? "PASS cached next-app width applied without hiding" : "FAIL next-app width not applied")
+        print(cached ? "PASS retained width covers longer menus during handoff" : "FAIL handoff exposes the right end of the next app menu")
         switchingUntil = nil
         switchExpiryTask?.cancel()
         measuredAt = Date()
         measurement = MenuMeasurement(pid: pid, frame: CGRect(x: screen.frame.minX, y: 0, width: 520, height: 32), tracking: false, count: 8)
-        applyGeometry(measurement!); refreshVisibility()
-        let resized = covers.first === original && original.targetAlpha == 1 && original.frame.width == 526
-        print(resized ? "PASS measured bounds replace cache without a fade" : "FAIL measured bounds recreate or fade the cover")
-        covers.forEach { $0.orderOut(nil); $0.close() }
-        return before && during && cached && resized
+        receiveMeasurement(measurement, requestedPID: pid, token: generation, startedAt: Date())
+        let followup = queryTask != nil
+        let resized = covers.first === original && original.targetAlpha == 1 && original.frame.width >= 906
+        print(resized ? "PASS short early measurement cannot shrink the cover" : "FAIL short early measurement exposes long menus")
+        print(followup ? "PASS first successful read schedules settling measurements" : "FAIL first success ends measurement too early")
+        receiveMeasurement(nil, requestedPID: pid, token: generation, startedAt: Date())
+        let incomplete = covers.first === original && original.targetAlpha == 1 && queryTask != nil
+        print(incomplete ? "PASS incomplete settling read retains cover and retries" : "FAIL incomplete settling read tears down cover")
+        let oldPID = pid, oldGeneration = generation
+        beginHandoff(to: -99)
+        receiveMeasurement(nil, requestedPID: oldPID, token: oldGeneration, startedAt: Date())
+        let stale = covers.first === original && pid == -99 && original.targetAlpha == 1
+        print(stale ? "PASS delayed previous-app failure cannot tear down new cover" : "FAIL stale failure invalidates current cover")
+        var rapid = true
+        var widest: CGFloat = 906
+        for index in 0..<100 {
+            beginHandoff(to: -100 - Int32(index))
+            // An early short layout arrives before the final long layout.
+            measuredAt = Date()
+            applyGeometry(MenuMeasurement(pid: pid, frame: CGRect(x: screen.frame.minX, y: 0, width: 300, height: 32), tracking: false, count: 5))
+            rapid = rapid && covers.first === original && original.frame.width >= widest && original.targetAlpha == 1
+            let width = CGFloat(700 + index * 3)
+            applyGeometry(MenuMeasurement(pid: pid, frame: CGRect(x: screen.frame.minX, y: 0, width: width, height: 32), tracking: false, count: 10))
+            widest = max(widest, width + 6)
+            refreshVisibility(animate: false)
+            rapid = rapid && original.frame.width >= widest && original.alphaValue == 1
+        }
+        print(rapid ? "PASS 100 rapid handoffs preserve complete coverage and opacity" : "FAIL rapid handoffs expose menu text")
+        settlingUntil = .distantPast
+        applyGeometry(MenuMeasurement(pid: pid, frame: CGRect(x: screen.frame.minX, y: 0, width: 300, height: 32), tracking: false, count: 5))
+        let settled = original.frame.width == 306
+        print(settled ? "PASS settled menu releases guard space for status icons" : "FAIL guard permanently occupies status icon space")
+        beginHandoff(to: -500)
+        let restored = original.frame.width >= widest && original.alphaValue == 1
+        print(restored ? "PASS next switch restores the wider guard immediately" : "FAIL next switch starts with short coverage")
+        queryTask?.cancel(); queryTask = nil
+        scheduleQuery()
+        let pending = queryTask
+        for _ in 0..<100 { scheduleQuery() }
+        let coalesced = pending === queryTask
+        print(coalesced ? "PASS notification burst cannot postpone the pending read" : "FAIL notification burst starves measurement")
+        // Expiry must still remove the guard if no usable new geometry arrives.
+        let expiry = switchExpiryTask
+        expiry?.perform()
+        let expired = covers.isEmpty && measuredAt == nil
+        print(expired ? "PASS failed handoff removes its cover" : "FAIL failed handoff retains stale cover")
+        return before && during && cached && resized && followup && incomplete && stale && rapid && settled && restored && coalesced && expired
     }
 }
 let app = NSApplication.shared

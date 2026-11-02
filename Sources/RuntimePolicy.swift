@@ -5,6 +5,12 @@ import CoreGraphics
 struct RuntimePolicy {
     static let geometryLifetime: TimeInterval = 5
     static let appSwitchGrace: TimeInterval = 0.5
+    static let appSwitchSettling: TimeInterval = 0.9
+    // Menus can grow before activation/AX notifications reach us. During a
+    // handoff, keep the widest measured envelope instead of a short early sample.
+    static func coverWidth(measured: CGFloat, retained: CGFloat, displayWidth: CGFloat) -> CGFloat {
+        min(ceil(max(measured, retained)), displayWidth)
+    }
     static func mayCover(installed: Bool, trusted: Bool, enabled: Bool, awake: Bool,
                          measuredAt: Date?, now: Date, switchingUntil: Date? = nil) -> Bool {
         guard installed, trusted, enabled, awake, let measuredAt else { return false }

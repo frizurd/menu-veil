@@ -5,6 +5,7 @@ import QuartzCore
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let defaults = UserDefaults.standard
     private let queue = DispatchQueue(label: "local.menu-veil.geometry", qos: .utility)
+    private let observerQueue = DispatchQueue(label: "local.menu-veil.observer", qos: .utility)
     private var status: NSStatusItem!
     private var toggleItem: NSMenuItem!
     private var hoverItem: NSMenuItem!
@@ -16,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var monitors: [Any] = []
     private var observers: [NSObjectProtocol] = []
     private var reader: AXObserver?
+    private var observerGeneration = 0
     private var reading = false
     private var generation = 0
     private var pid: pid_t = 0
@@ -24,7 +26,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var switchExpiryTask: DispatchWorkItem?
     private var lastAttempt = Date.distantPast
     private var measurement: MenuMeasurement?
+    private var coverWidths: [CGDirectDisplayID: CGFloat] = [:]
     private var widthCache: [String: CGFloat] = [:]
+    private var settlingUntil = Date.distantPast
     private var trusted = false
     private var awake = true
     private var hovering = false
@@ -93,7 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
             observe(center, name) { [weak self] in self?.awake = true; self?.frontChanged() }
         }
-        observe(NotificationCenter.default, NSApplication.didChangeScreenParametersNotification) { [weak self] in self?.widthCache.removeAll(); self?.invalidateGeometry(); self?.scheduleQuery() }
+        observe(NotificationCenter.default, NSApplication.didChangeScreenParametersNotification) { [weak self] in self?.coverWidths.removeAll(); self?.widthCache.removeAll(); self?.invalidateGeometry(); self?.scheduleQuery() }
         observe(NotificationCenter.default, NSApplication.didBecomeActiveNotification) { [weak self] in self?.healthCheck() }
         heartbeat = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.healthCheck() }
         heartbeat?.tolerance = 0.25
@@ -116,70 +120,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func invalidateGeometry() {
         generation += 1
         switchExpiryTask?.cancel(); switchExpiryTask = nil; switchingUntil = nil
+        queryTask?.cancel(); queryTask = nil; settlingUntil = .distantPast
         measuredAt = nil; measurement = nil; lastAttempt = .distantPast
         covers.forEach { $0.orderOut(nil); $0.close() }; covers.removeAll()
     }
     private func frontChanged() {
         guard let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
-        if pid != app.processIdentifier {
-            pid = app.processIdentifier
-            menuOpen = false
-            revealUntil = .distantPast
-            // An app switch is a handoff, not a loss of permission/geometry.
-            // Keep the existing window and opacity while its bounds are refreshed.
-            generation += 1
-            measurement = nil
-            lastAttempt = .distantPast
-            if let panel = covers.first, let screen = panel.screen,
-               let cachedWidth = widthCache[cacheKey(for: pid, screen: screen)] {
-                var frame = panel.frame
-                frame.size.width = min(cachedWidth, screen.frame.width)
-                panel.setFrame(frame, display: true)
-            }
-            switchExpiryTask?.cancel()
-            let deadline = Date().addingTimeInterval(RuntimePolicy.appSwitchGrace)
-            switchingUntil = deadline
-            let expiry = DispatchWorkItem { [weak self] in
-                guard let self, self.switchingUntil == deadline else { return }
-                self.invalidateGeometry(); self.refreshVisibility()
-            }
-            switchExpiryTask = expiry
-            DispatchQueue.main.asyncAfter(deadline: .now() + RuntimePolicy.appSwitchGrace, execute: expiry)
-            attachObserver()
-            queryTask?.cancel()
-            queryMenus()
-            return
+        if pid != app.processIdentifier { beginHandoff(to: app.processIdentifier) }
+        else { scheduleQuery() }
+    }
+    private func beginHandoff(to nextPID: pid_t) {
+        pid = nextPID
+        menuOpen = false
+        revealUntil = .distantPast
+        // An app switch is a handoff, not a loss of permission/geometry.
+        // Keep the existing window and opacity while its bounds are refreshed.
+        generation += 1
+        measurement = nil
+        lastAttempt = .distantPast
+        settlingUntil = Date().addingTimeInterval(RuntimePolicy.appSwitchSettling)
+        if let panel = covers.first, let screen = panel.screen,
+           let display = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
+            var frame = panel.frame
+            frame.size.width = RuntimePolicy.coverWidth(measured: frame.width,
+                retained: coverWidths[display] ?? 0, displayWidth: screen.frame.width)
+            panel.setFrame(frame, display: true)
+            panel.contentView?.needsDisplay = true
         }
-        scheduleQuery()
+        switchExpiryTask?.cancel()
+        let deadline = Date().addingTimeInterval(RuntimePolicy.appSwitchGrace)
+        switchingUntil = deadline
+        let expiry = DispatchWorkItem { [weak self] in
+            guard let self, self.switchingUntil == deadline else { return }
+            self.invalidateGeometry(); self.refreshVisibility()
+        }
+        switchExpiryTask = expiry
+        DispatchQueue.main.asyncAfter(deadline: .now() + RuntimePolicy.appSwitchGrace, execute: expiry)
+        queryTask?.cancel(); queryTask = nil
+        queryMenus()
+        refreshVisibility(animate: false)
+        attachObserver()
     }
     private func attachObserver() {
+        observerGeneration += 1
         if let reader { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(reader), .commonModes) }
         reader = nil
-        guard trusted, pid > 0 else { return }
-        var value: AXObserver?
-        guard AXObserverCreate(pid, { _, element, notification, context in
-            guard let context else { return }
-            let owner = Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue()
-            var notificationPID: pid_t = 0
-            guard AXUIElementGetPid(element, &notificationPID) == .success, notificationPID == owner.pid else { return }
-            if notification as String == kAXMenuOpenedNotification || notification as String == kAXMenuClosedNotification {
-                owner.revealUntil = Date().addingTimeInterval(0.55)
-                owner.refreshVisibility()
+        guard trusted, awake, pid > 0 else { return }
+        let requestedPID = pid, token = observerGeneration
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        // Notification registration is synchronous IPC. A slow app must not
+        // block the main thread, the cover, or the new app's geometry query.
+        observerQueue.async { [weak self] in
+            var value: AXObserver?
+            guard AXObserverCreate(requestedPID, { _, element, notification, context in
+                guard let context else { return }
+                let owner = Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue()
+                var notificationPID: pid_t = 0
+                guard AXUIElementGetPid(element, &notificationPID) == .success, notificationPID == owner.pid else { return }
+                if notification as String == kAXMenuOpenedNotification || notification as String == kAXMenuClosedNotification {
+                    owner.revealUntil = Date().addingTimeInterval(0.55)
+                    owner.refreshVisibility()
+                }
+                owner.scheduleQuery()
+            }, &value) == .success, let value else { return }
+            let app = AXUIElementCreateApplication(requestedPID)
+            AXUIElementSetMessagingTimeout(app, 0.1)
+            for name in [kAXFocusedWindowChangedNotification, kAXMenuOpenedNotification, kAXMenuClosedNotification, kAXLayoutChangedNotification] {
+                AXObserverAddNotification(value, app, name as CFString, context)
             }
-            owner.scheduleQuery()
-        }, &value) == .success, let value else { return }
-        reader = value
-        let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.15)
-        for name in [kAXFocusedWindowChangedNotification, kAXMenuOpenedNotification, kAXMenuClosedNotification, kAXLayoutChangedNotification] {
-            // Apps may not support every notification. The low-frequency health check remains a fallback.
-            AXObserverAddNotification(value, app, name as CFString, Unmanaged.passUnretained(self).toOpaque())
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.observerGeneration == token, self.pid == requestedPID, self.trusted, self.awake else { return }
+                self.reader = value
+                CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(value), .commonModes)
+            }
         }
-        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(value), .commonModes)
     }
     private func scheduleQuery() {
-        queryTask?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.queryMenus() }
+        // Coalesce notifications without moving an already scheduled read back.
+        // Continuous layout events must not starve the handoff measurement.
+        guard queryTask == nil else { return }
+        let work = DispatchWorkItem { [weak self] in self?.queryTask = nil; self?.queryMenus() }
         queryTask = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
     }
@@ -213,25 +233,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.reading = false
-                // A response from the previous app must not tear down the cover
-                // retained for the new app, or restart its measurement generation.
-                guard self.generation == token, self.pid == requestedPID else { self.queryMenus(); return }
-                guard RuntimePolicy.acceptsResult(generation: self.generation, requestedGeneration: token,
-                    pid: self.pid, requestedPID: requestedPID, trusted: self.trusted, awake: self.awake,
-                    startedAt: startedAt, now: Date()) else { self.invalidateGeometry(); self.scheduleQuery(); return }
-                guard let result else {
-                    if let deadline = self.switchingUntil, Date() < deadline { self.scheduleQuery(); return }
-                    // Never leave an old cover over menus we can no longer locate.
-                    self.invalidateGeometry(); self.refreshVisibility(); return
-                }
-                self.measurement = result
-                self.measuredAt = Date()
-                self.switchExpiryTask?.cancel(); self.switchExpiryTask = nil; self.switchingUntil = nil
-                self.applyGeometry(result)
-                self.pointerChanged()
-                self.refreshSetup()
+                self.frontChangedIfNeeded()
+                self.receiveMeasurement(result, requestedPID: requestedPID, token: token, startedAt: startedAt)
             }
         }
+    }
+    private func receiveMeasurement(_ result: MenuMeasurement?, requestedPID: pid_t, token: Int, startedAt: Date) {
+        // A response from the previous app must not tear down the cover
+        // retained for the new app, or restart its measurement generation.
+        guard generation == token, pid == requestedPID else { queryMenus(); return }
+        guard RuntimePolicy.acceptsResult(generation: generation, requestedGeneration: token,
+            pid: pid, requestedPID: requestedPID, trusted: trusted, awake: awake,
+            startedAt: startedAt, now: Date()) else { invalidateGeometry(); scheduleQuery(); return }
+        guard let result else {
+            if Date() < settlingUntil { scheduleQuery(); return }
+            // Never leave an old cover over menus we can no longer locate.
+            invalidateGeometry(); refreshVisibility(); return
+        }
+        measurement = result
+        measuredAt = Date()
+        switchExpiryTask?.cancel(); switchExpiryTask = nil; switchingUntil = nil
+        applyGeometry(result)
+        pointerChanged(animate: false)
+        refreshSetup()
+        // The first successful AX read may precede the final menu layout.
+        // Keep sampling through the activation burst, without resizing down.
+        if Date() < settlingUntil { scheduleQuery() }
     }
     private func applyGeometry(_ result: MenuMeasurement) {
         let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
@@ -239,10 +266,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             RuntimePolicy.belongsToDisplay(menu: result.frame, display: CGRect(x: $0.frame.minX, y: primaryTop - $0.frame.maxY, width: $0.frame.width, height: $0.frame.height))
         }) else { invalidateGeometry(); return }
         let height = max(screen.safeAreaInsets.top, NSStatusBar.system.thickness)
-        let frame = CGRect(x: screen.frame.minX, y: screen.frame.maxY - height,
-                           width: min(ceil(result.frame.maxX - screen.frame.minX + 6), screen.frame.width), height: height)
+        guard let display = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else { invalidateGeometry(); return }
+        let measuredWidth = min(ceil(result.frame.maxX - screen.frame.minX + 6), screen.frame.width)
+        let settling = Date() < settlingUntil
+        let key = "\(result.pid):\(display)"
+        let appWidth = settling ? max(measuredWidth, widthCache[key] ?? 0) : measuredWidth
+        let width = RuntimePolicy.coverWidth(measured: appWidth,
+            retained: settling ? coverWidths[display] ?? 0 : 0, displayWidth: screen.frame.width)
+        let frame = CGRect(x: screen.frame.minX, y: screen.frame.maxY - height, width: width, height: height)
+        // The wider guard is temporary: settled short menus must give status
+        // icons their space back. Cache only measurements, never the guard width.
         if widthCache.count >= 32 { widthCache.removeAll() }
-        widthCache[cacheKey(for: result.pid, screen: screen)] = frame.width
+        widthCache[key] = appWidth
+        coverWidths[display] = max(coverWidths[display] ?? 0, measuredWidth)
         // Only cover the display whose menu bounds were actually measured. Never reuse a guessed width elsewhere.
         if let panel = covers.first, panel.screen == screen {
             if panel.frame != frame { panel.setFrame(frame, display: true); panel.contentView?.needsDisplay = true }
@@ -259,10 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             covers = [panel]
         }
     }
-    private func cacheKey(for pid: pid_t, screen: NSScreen) -> String {
-        "\(pid):\(screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] ?? 0)"
-    }
-    private func pointerChanged() {
+    private func pointerChanged(animate: Bool = true) {
         guard installed, trusted, awake, enabled else { return }
         let pointer = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { $0.frame.contains(pointer) }
@@ -277,7 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             concealTask = work
             DispatchQueue.main.asyncAfter(deadline: .now() + max(0.01, revealUntil.timeIntervalSinceNow), execute: work)
         }
-        refreshVisibility()
+        refreshVisibility(animate: animate)
     }
     private func syncMouseMonitors() {
         let needed = installed && trusted && awake && enabled
@@ -290,15 +323,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let monitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in self?.pointerChanged() }) { monitors.append(monitor) }
         if let monitor = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in self?.pointerChanged(); return event }) { monitors.append(monitor) }
     }
-    private func refreshVisibility() {
+    private func refreshVisibility(animate: Bool = true) {
         syncMouseMonitors()
         let ready = RuntimePolicy.mayCover(installed: installed, trusted: trusted, enabled: enabled, awake: awake, measuredAt: measuredAt, now: Date(), switchingUntil: switchingUntil)
         let alpha: CGFloat = ready && !revealed ? 1 : 0
-        for panel in covers where panel.targetAlpha != alpha {
+        for panel in covers where panel.targetAlpha != alpha || (!animate && alpha == 1) {
             panel.targetAlpha = alpha
             if alpha > 0 && !panel.isVisible { panel.orderFrontRegardless() }
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : (alpha == 0 ? 0.2 : 0.32)
+                context.duration = (!animate && alpha == 1) || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : (alpha == 0 ? 0.2 : 0.32)
                 context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                 panel.animator().alphaValue = alpha
             }

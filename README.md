@@ -39,7 +39,7 @@ If permission is already on but the app can't read the menus, open **Setup & tro
 
 The app is written in Swift with AppKit. The cover is a window above the menu bar. Clicks go through it to the real menus underneath.
 
-It measures when you switch apps or a supported menu notification arrives, with a three-second fallback while idle. While menus are revealed, it checks more often. That includes the Apple menu and greyed-out headings. The hover fade takes 0.2 seconds; hiding waits about half a second, then fades over 0.32 seconds. Opening a menu keeps it revealed. If you have Reduce Motion on, the fades are off.
+It measures when you switch apps or a supported menu notification arrives, with a three-second fallback while idle. After a switch, it takes several readings over about a second to catch menus that are still changing. While menus are revealed, it checks more often. That includes the Apple menu and greyed-out headings. The hover fade takes 0.2 seconds; hiding waits about half a second, then fades over 0.32 seconds. Geometry updates keep a hidden cover opaque. Opening a menu keeps it revealed. If you have Reduce Motion on, the fades are off.
 
 For the cover background, it reads your wallpaper image. It doesn't record the screen or make network requests. There are no third-party dependencies.
 
@@ -59,7 +59,7 @@ Permission missing, app not installed yet, Mac asleep, or menu bounds unavailabl
 
 Opening another copy focuses the existing instance instead of creating another cover. Build-folder copies don't request permission, which helps avoid duplicate grants. Releases keep the same bundle ID and Developer ID signing identity; development builds can still need permission granted again after rebuilding.
 
-On app switches, the current cover stays visible while the new bounds are measured. Recent app widths are cached per display, and the same panel resizes in place. If the handoff cannot finish within half a second, the menus are revealed.
+On app switches, the same cover stays visible and temporarily expands to the widest menu measured on that display. It doesn't shrink to an old cached width or the first short reading. Once the new layout settles, it returns to that app's measured width. Incomplete snapshots are rejected, and late replies from earlier apps cannot remove the current cover. If no usable reading arrives within half a second, the menus are revealed. A previously unseen wider menu still needs a fresh measurement; this overlay cannot guarantee that macOS will never draw a frame before its activation notification arrives.
 
 The hover handler uses mouse events rather than a repeating 20 Hz timer. Mouse monitors are removed when paused, asleep, or waiting for permission. Wallpaper images are cached, and routine diagnostics are off. The app still does a low-frequency health check so it can recover when permission changes.
 
@@ -71,6 +71,8 @@ You'll need Xcode's command line tools:
 zsh scripts/test.sh
 zsh build.sh
 ```
+
+`zsh scripts/test-app-switch.sh` also checks the real AppKit panel through 100 simulated handoffs, short early layouts, delayed responses, and timeouts. It needs a graphical macOS session; it doesn't switch your apps or send input.
 
 This creates a development app in `build/`. Move it into Applications before normal use. The build supports Apple silicon and Intel, targeting macOS 14 or newer; runtime testing so far has been on macOS 27.0.1.
 

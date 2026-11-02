@@ -24,3 +24,7 @@ check(!RuntimePolicy.acceptsResult(generation: 1, requestedGeneration: 1, pid: 4
 check(RuntimePolicy.mayCover(installed: true, trusted: true, enabled: true, awake: true, measuredAt: now, now: now, switchingUntil: now.addingTimeInterval(0.5)), "retain fresh cover during app handoff")
 check(!RuntimePolicy.mayCover(installed: true, trusted: true, enabled: true, awake: true, measuredAt: now, now: now, switchingUntil: now.addingTimeInterval(-0.1)), "failed handoff expires even with fresh previous geometry")
 check(!RuntimePolicy.mayCover(installed: true, trusted: false, enabled: true, awake: true, measuredAt: now, now: now, switchingUntil: now.addingTimeInterval(0.5)), "handoff never overrides revoked permission")
+check(RuntimePolicy.coverWidth(measured: 526, retained: 906, displayWidth: 1728) == 906, "short early sample retains full long-menu coverage")
+check(RuntimePolicy.coverWidth(measured: 1006, retained: 906, displayWidth: 1728) == 1006, "longer measurement expands guard immediately")
+check(RuntimePolicy.coverWidth(measured: 526, retained: 0, displayWidth: 1728) == 526, "settled short menu releases temporary guard space")
+check(RuntimePolicy.coverWidth(measured: 2000, retained: 906, displayWidth: 1728) == 1728, "guard cannot spill onto another display")
