@@ -1,0 +1,17 @@
+name: Check
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check visibility and geometry safeguards
+        run: zsh scripts/test.sh
+      - name: Build development app (Apple silicon and Intel)
+        run: zsh build.sh
+      - name: Verify app bundle
+        run: codesign --verify --strict "build/Menu Veil.app"

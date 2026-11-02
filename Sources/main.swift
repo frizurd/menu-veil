@@ -1,328 +1,357 @@
-// Menu Veil: disposable prototype; Accessibility is used to read menu geometry.
 import AppKit
 import ApplicationServices
 import QuartzCore
 
-struct MenuMeasurement {
-    let pid: pid_t
-    let frame: CGRect
-    let tracking: Bool
-    let count: Int
-}
-
-// Read the real menu items, including disabled headings and the Apple menu.
-// Do not guess widths from app names, or capture/recognize screen pixels.
-func measureMenus(pid: pid_t) -> MenuMeasurement? {
-    let application = AXUIElementCreateApplication(pid)
-    AXUIElementSetMessagingTimeout(application, 0.15)
-    func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
-        return value
-    }
-    guard let value = attribute(application, kAXMenuBarAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-    let menuBar = value as! AXUIElement
-    guard let children = attribute(menuBar, kAXChildrenAttribute) as? [AXUIElement] else { return nil }
-    var bounds = CGRect.null
-    var count = 0
-    var tracking = !(attribute(menuBar, kAXSelectedChildrenAttribute) as? [AXUIElement] ?? []).isEmpty
-    for child in children {
-        guard attribute(child, kAXRoleAttribute) as? String == kAXMenuBarItemRole,
-              let position = attribute(child, kAXPositionAttribute), CFGetTypeID(position) == AXValueGetTypeID(),
-              let sizeValue = attribute(child, kAXSizeAttribute), CFGetTypeID(sizeValue) == AXValueGetTypeID() else { continue }
-        var origin = CGPoint.zero
-        var size = CGSize.zero
-        guard AXValueGetValue(position as! AXValue, .cgPoint, &origin),
-              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size),
-              size.width > 0, size.height > 0, size.height < 80 else { continue }
-        bounds = bounds.union(CGRect(origin: origin, size: size))
-        count += 1
-        tracking = tracking || (attribute(child, kAXSelectedAttribute) as? Bool == true)
-    }
-    guard count > 1, !bounds.isNull else { return nil }
-    return MenuMeasurement(pid: pid, frame: bounds, tracking: tracking, count: count)
-}
-
-final class CoverPanel: NSPanel {
-    var targetAlpha: CGFloat = -1
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
-}
-
-final class WallpaperStrip: NSView {
-    let screenFrame: NSRect
-    let wallpaper: NSImage?
-    var mode: Int
-
-    init(frame: NSRect, screen: NSScreen, mode: Int) {
-        screenFrame = screen.frame
-        wallpaper = NSWorkspace.shared.desktopImageURL(for: screen).flatMap { NSImage(contentsOf: $0) }
-        self.mode = mode
-        super.init(frame: frame)
-    }
-    required init?(coder: NSCoder) { fatalError("Not used") }
-
-    override func draw(_ dirtyRect: NSRect) {
-        (mode == 2 ? NSColor(white: 0.94, alpha: 1) : NSColor(white: 0.12, alpha: 1)).setFill()
-        bounds.fill()
-        guard mode == 0, let wallpaper, wallpaper.size.width > 0, wallpaper.size.height > 0 else { return }
-        // Reconstruct the desktop's aspect-fill image; never capture the screen.
-        let scale = max(screenFrame.width / wallpaper.size.width, screenFrame.height / wallpaper.size.height)
-        let size = NSSize(width: wallpaper.size.width * scale, height: wallpaper.size.height * scale)
-        let destination = NSRect(x: (screenFrame.width - size.width) / 2,
-                                 y: (screenFrame.height - size.height) / 2 - screenFrame.height + bounds.height,
-                                 width: size.width, height: size.height)
-        wallpaper.draw(in: destination, from: .zero, operation: .copy, fraction: 1)
-    }
-}
-
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    var status: NSStatusItem!
-    var covers: [CoverPanel] = []
-    var timer: Timer?
-    var enabled = true
-    var revealOnHover = true
-    var measuredWidth: CGFloat?
-    var measurement: MenuMeasurement?
-    var frontPID: pid_t = 0
-    var readingMenus = false
-    var lastMeasurementAt = Date.distantPast
-    let measurementQueue = DispatchQueue(label: "local.menu-veil.menu-geometry", qos: .userInitiated)
-    var accessibilityGranted = false
-    var setupWindow: NSWindow?
-    var mode = 0
-    var revealUntil = Date.distantPast
-    var menuOpen = false
-    var isRevealed = false
-    var tickCount = 0
-    var toggleItem: NSMenuItem!
-    var hoverItem: NSMenuItem!
-    var sizingItem: NSMenuItem!
+    private let defaults = UserDefaults.standard
+    private let queue = DispatchQueue(label: "local.menu-veil.geometry", qos: .utility)
+    private var status: NSStatusItem!
+    private var toggleItem: NSMenuItem!
+    private var hoverItem: NSMenuItem!
+    private var sizingItem: NSMenuItem!
+    private var covers: [CoverPanel] = []
+    private var heartbeat: Timer?
+    private var concealTask: DispatchWorkItem?
+    private var queryTask: DispatchWorkItem?
+    private var monitors: [Any] = []
+    private var observers: [NSObjectProtocol] = []
+    private var reader: AXObserver?
+    private var reading = false
+    private var generation = 0
+    private var pid: pid_t = 0
+    private var measuredAt: Date?
+    private var lastAttempt = Date.distantPast
+    private var measurement: MenuMeasurement?
+    private var trusted = false
+    private var awake = true
+    private var hovering = false
+    private var menuOpen = false
+    private var revealUntil = Date.distantPast
+    private var setupWindow: NSWindow?
+    private var setupStatus: NSTextField?
+    private var setupButton: NSButton?
+    private var lastDisplay: CGDirectDisplayID?
+    private var diagnosticState = ""
+    private var enabled = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true
+    private var hoverEnabled = UserDefaults.standard.object(forKey: "hover") as? Bool ?? true
+    private var mode = UserDefaults.standard.integer(forKey: "background")
+    private var diagnosticMode: Bool { CommandLine.arguments.contains("--diagnostics") }
+    private lazy var installed: Bool = {
+        if CommandLine.arguments.contains("--allow-development") { return true }
+        let path = Bundle.main.bundleURL.standardizedFileURL.path
+        return path.hasPrefix("/Applications/") || path.hasPrefix(NSHomeDirectory() + "/Applications/")
+    }()
+    private var permissionName: String {
+        ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 ? "Device Control and Data Access" : "Accessibility"
+    }
+    private var revealed: Bool { hovering || menuOpen || measurement?.tracking == true || Date() < revealUntil }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // A duplicate launch must never create another cover or another permission request.
+        let identity = Bundle.main.bundleIdentifier ?? "local.frizurd.menu-veil-prototype"
+        if NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == identity && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
+            DistributedNotificationCenter.default().postNotificationName(Notification.Name(identity + ".showSetup"), object: nil)
+            NSApp.terminate(nil)
+            return
+        }
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(showSetup), name: Notification.Name(identity + ".showSetup"), object: nil)
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         status.button?.image = NSImage(systemSymbolName: "rectangle.lefthalf.inset.filled", accessibilityDescription: "Menu Veil")
-        status.button?.toolTip = "Menu Veil — hover top left to reveal menus"
+        status.button?.toolTip = "Menu Veil — hover over the left menus to reveal them"
         let menu = NSMenu()
         menu.delegate = self
-        let title = NSMenuItem(title: "Menu Veil · Prototype", action: nil, keyEquivalent: "")
-        title.isEnabled = false
+        let title = NSMenuItem(title: "Menu Veil", action: nil, keyEquivalent: "")
         menu.addItem(title)
+        sizingItem = NSMenuItem(title: "Checking permission…", action: nil, keyEquivalent: "")
+        menu.addItem(sizingItem)
         menu.addItem(.separator())
         toggleItem = item("Hide left menus", #selector(toggle), menu)
-        hoverItem = item("Reveal when hovering top left", #selector(toggleHover), menu)
-        item("Reveal for 10 seconds", #selector(reveal), menu)
-        sizingItem = NSMenuItem(title: "Automatic sizing · waiting for permission", action: nil, keyEquivalent: "")
-        menu.addItem(sizingItem)
-        item("Set up automatic sizing…", #selector(showSetup), menu)
+        hoverItem = item("Reveal on hover", #selector(toggleHover), menu)
+        item("Show menus for 10 seconds", #selector(reveal), menu)
         let backgrounds = NSMenu()
-        for (index, name) in ["Wallpaper", "Dark solid", "Light solid"].enumerated() {
+        for (index, name) in ["Wallpaper", "Dark", "Light"].enumerated() {
             let entry = item(name, #selector(changeBackground(_:)), backgrounds)
             entry.tag = index
         }
-        let backgroundItem = NSMenuItem(title: "Background", action: nil, keyEquivalent: "")
-        backgroundItem.submenu = backgrounds
-        menu.addItem(backgroundItem)
+        let background = NSMenuItem(title: "Background", action: nil, keyEquivalent: "")
+        background.submenu = backgrounds
+        menu.addItem(background)
         menu.addItem(.separator())
-        item("Quit Menu Veil", #selector(quit), menu)
+        item("Setup & troubleshooting…", #selector(showSetup), menu)
+        item("Quit Menu Veil", #selector(quit), menu).keyEquivalent = "q"
         status.menu = menu
-        NotificationCenter.default.addObserver(self, selector: #selector(rebuild), name: NSApplication.didChangeScreenParametersNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(rebuild), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
-        rebuild()
-        refreshMenu()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.tick() }
-        RunLoop.main.add(timer!, forMode: .common)
-        print("Menu Veil running. Public window levels: mainMenu=\(NSWindow.Level.mainMenu.rawValue), status=\(NSWindow.Level.statusBar.rawValue).")
-        for screen in NSScreen.screens {
-            print("Display: \(screen.localizedName), frame=\(screen.frame), menuHeight=\(screen.safeAreaInsets.top), wallpaperAvailable=\(NSWorkspace.shared.desktopImageURL(for: screen) != nil)")
+        let center = NSWorkspace.shared.notificationCenter
+        observe(center, NSWorkspace.didActivateApplicationNotification) { [weak self] in self?.frontChanged() }
+        observe(center, NSWorkspace.activeSpaceDidChangeNotification) { [weak self] in self?.invalidateGeometry(); self?.scheduleQuery() }
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
+            observe(center, name) { [weak self] in self?.awake = false; self?.invalidateGeometry(); self?.refreshVisibility() }
         }
-        fflush(stdout)
-        if !AXIsProcessTrusted() { showSetup() }
-        if let flag = CommandLine.arguments.firstIndex(of: "--quit-after"), flag + 1 < CommandLine.arguments.count,
-           let seconds = Double(CommandLine.arguments[flag + 1]) {
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+            observe(center, name) { [weak self] in self?.awake = true; self?.frontChanged() }
+        }
+        observe(NotificationCenter.default, NSApplication.didChangeScreenParametersNotification) { [weak self] in self?.invalidateGeometry(); self?.scheduleQuery() }
+        observe(NotificationCenter.default, NSApplication.didBecomeActiveNotification) { [weak self] in self?.healthCheck() }
+        heartbeat = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.healthCheck() }
+        heartbeat?.tolerance = 0.25
+        RunLoop.main.add(heartbeat!, forMode: .common)
+        healthCheck()
+        if !installed || !trusted || !defaults.bool(forKey: "onboarded") || CommandLine.arguments.contains("--onboarding") { showSetup() }
+        if let index = CommandLine.arguments.firstIndex(of: "--quit-after"), index + 1 < CommandLine.arguments.count,
+           let seconds = Double(CommandLine.arguments[index + 1]), seconds > 0 {
             Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { _ in NSApp.terminate(nil) }
         }
     }
 
-    @discardableResult
-    func item(_ title: String, _ action: Selector, _ menu: NSMenu) -> NSMenuItem {
+    private func observe(_ center: NotificationCenter, _ name: Notification.Name, action: @escaping () -> Void) {
+        observers.append(center.addObserver(forName: name, object: nil, queue: .main) { _ in action() })
+    }
+    @discardableResult private func item(_ title: String, _ action: Selector, _ menu: NSMenu) -> NSMenuItem {
         let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
-        entry.target = self
-        menu.addItem(entry)
-        return entry
+        entry.target = self; menu.addItem(entry); return entry
     }
-
-    @objc func rebuild() {
-        covers.forEach { $0.close() }
-        covers = NSScreen.screens.map { screen in
-            let height = max(screen.safeAreaInsets.top, NSStatusBar.system.thickness)
-            let rect = NSRect(x: screen.frame.minX, y: screen.frame.maxY - height,
-                              width: min(measuredWidth ?? 1, screen.frame.width), height: height)
-            let panel = CoverPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-            panel.title = "Menu Veil Cover"
-            panel.isReleasedWhenClosed = false
-            panel.isOpaque = true
-            panel.backgroundColor = .black
-            panel.hasShadow = false
-            panel.hidesOnDeactivate = false
-            panel.ignoresMouseEvents = true
-            panel.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
-            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-            panel.animationBehavior = .none
-            panel.alphaValue = 0
-            panel.contentView = WallpaperStrip(frame: NSRect(origin: .zero, size: rect.size), screen: screen, mode: mode)
-            return panel
-        }
-        tick()
+    private func invalidateGeometry() {
+        generation += 1
+        measuredAt = nil; measurement = nil; lastAttempt = .distantPast
+        covers.forEach { $0.orderOut(nil); $0.close() }; covers.removeAll()
     }
-
-    func tick() {
-        updateMeasurement()
-        let pointer = NSEvent.mouseLocation
-        let overStrip = measuredWidth != nil && covers.contains { $0.frame.insetBy(dx: 0, dy: -3).contains(pointer) }
-        if revealOnHover && overStrip {
-            // Leave a grace period to move into a dropdown without hiding its heading.
-            revealUntil = Date().addingTimeInterval(0.55)
+    private func frontChanged() {
+        guard let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        if pid != app.processIdentifier {
+            pid = app.processIdentifier
+            menuOpen = false
+            invalidateGeometry()
+            attachObserver()
         }
-        let shouldReveal = menuOpen || measurement?.tracking == true || (revealOnHover && overStrip) || Date() < revealUntil
-        if shouldReveal != isRevealed {
-            isRevealed = shouldReveal
-            print("Menus \(shouldReveal ? "revealed" : "covered"); pointer=\(pointer)")
-            fflush(stdout)
-        }
-        for cover in covers {
-            let alpha: CGFloat = enabled && measuredWidth != nil && accessibilityGranted && !shouldReveal ? 1 : 0
-            guard cover.targetAlpha != alpha else { continue }
-            cover.targetAlpha = alpha
-            if !cover.isVisible { cover.orderFrontRegardless() }
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : (alpha == 0 ? 0.20 : 0.32)
-                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                cover.animator().alphaValue = alpha
+        scheduleQuery()
+    }
+    private func attachObserver() {
+        if let reader { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(reader), .commonModes) }
+        reader = nil
+        guard trusted, pid > 0 else { return }
+        var value: AXObserver?
+        guard AXObserverCreate(pid, { _, _, notification, context in
+            guard let context else { return }
+            let owner = Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue()
+            if notification as String == kAXMenuOpenedNotification || notification as String == kAXMenuClosedNotification {
+                owner.revealUntil = Date().addingTimeInterval(0.55)
+                owner.refreshVisibility()
             }
+            owner.scheduleQuery()
+        }, &value) == .success, let value else { return }
+        reader = value
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.15)
+        for name in [kAXFocusedWindowChangedNotification, kAXMenuOpenedNotification, kAXMenuClosedNotification, kAXLayoutChangedNotification] {
+            // Apps may not support every notification. The low-frequency health check remains a fallback.
+            AXObserverAddNotification(value, app, name as CFString, Unmanaged.passUnretained(self).toOpaque())
         }
-        tickCount += 1
-        if tickCount % 25 == 0 { writeStatus() }
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(value), .commonModes)
     }
-
-    func updateMeasurement() {
-        let trusted = AXIsProcessTrusted()
-        if trusted != accessibilityGranted {
-            accessibilityGranted = trusted
-            if !trusted { measuredWidth = nil; measurement = nil }
-            else { setupWindow?.close(); setupWindow = nil }
+    private func scheduleQuery() {
+        queryTask?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.queryMenus() }
+        queryTask = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+    }
+    private func healthCheck() {
+        guard status != nil else { return }
+        // Do no Accessibility work while asleep or while the user session is inactive.
+        guard awake else { refreshVisibility(); return }
+        let access = installed && AXIsProcessTrusted()
+        if access != trusted {
+            trusted = access
+            invalidateGeometry()
+            attachObserver()
         }
-        guard trusted, let front = NSWorkspace.shared.frontmostApplication else {
-            sizingItem.title = "Automatic sizing · needs Accessibility"
-            return
-        }
-        // The setup window has no app menus of its own; keep the previous measurement.
-        guard front.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
-        if front.processIdentifier != frontPID {
-            frontPID = front.processIdentifier
-            measuredWidth = nil
-            measurement = nil
-            lastMeasurementAt = .distantPast
-            covers.forEach { $0.alphaValue = 0; $0.targetAlpha = -1 }
-        }
-        guard !readingMenus, Date().timeIntervalSince(lastMeasurementAt) >= 0.4 else { return }
-        readingMenus = true
-        lastMeasurementAt = Date()
-        let pid = frontPID
-        measurementQueue.async { [weak self] in
-            let result = measureMenus(pid: pid)
+        frontChangedIfNeeded()
+        if installed && trusted && enabled && Date().timeIntervalSince(lastAttempt) >= RuntimePolicy.measurementInterval(revealed: revealed) { queryMenus() }
+        refreshVisibility()
+        refreshSetup()
+    }
+    private func frontChangedIfNeeded() {
+        guard let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        if front.processIdentifier != pid { frontChanged() }
+    }
+    private func queryMenus() {
+        guard installed, trusted, enabled, awake, !reading, pid > 0 else { return }
+        reading = true
+        lastAttempt = Date()
+        let requestedPID = pid, token = generation
+        let startedAt = Date()
+        queue.async { [weak self] in
+            let result = measureMenus(pid: requestedPID)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.readingMenus = false
-                guard self.frontPID == pid, let result else { return }
-                self.measurement = result
-                // AX coordinates start at the top-left of the primary display.
-                let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
-                let source = NSScreen.screens.first { screen in
-                    CGRect(x: screen.frame.minX, y: primaryTop - screen.frame.maxY,
-                           width: screen.frame.width, height: screen.frame.height).contains(result.frame.origin)
-                } ?? NSScreen.main
-                let width = ceil(result.frame.maxX - (source?.frame.minX ?? result.frame.minX) + 6)
-                guard width > 30 else { return }
-                self.measuredWidth = width
-                self.sizingItem.title = "Automatic sizing · \(Int(width)) pt · \(result.count) menus"
-                for cover in self.covers {
-                    guard let screen = NSScreen.screens.first(where: { $0.frame.contains(cover.frame.origin) }) else { continue }
-                    var frame = cover.frame
-                    frame.size.width = min(width, screen.frame.width)
-                    if cover.frame != frame {
-                        cover.setFrame(frame, display: true)
-                        cover.contentView?.needsDisplay = true
-                    }
+                self.reading = false
+                guard RuntimePolicy.acceptsResult(generation: self.generation, requestedGeneration: token,
+                    pid: self.pid, requestedPID: requestedPID, trusted: self.trusted, awake: self.awake,
+                    startedAt: startedAt, now: Date()) else { self.invalidateGeometry(); self.scheduleQuery(); return }
+                guard let result else {
+                    // Never leave an old cover over menus we can no longer locate.
+                    self.invalidateGeometry(); self.refreshVisibility(); return
                 }
-                self.tick()
+                self.measurement = result
+                self.measuredAt = Date()
+                self.applyGeometry(result)
+                self.pointerChanged()
+                self.refreshSetup()
             }
         }
     }
-
-    func writeStatus() {
-        let data: [String: Any] = [
-            "enabled": enabled, "revealed": isRevealed, "hoverReveal": revealOnHover,
-            "width": measuredWidth ?? 0, "background": mode,
-            "automaticSizing": true, "accessibilityGranted": accessibilityGranted,
-            "menuCount": measurement?.count ?? 0,
-            "frontmostApp": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown",
-            "panels": covers.map { ["number": $0.windowNumber, "visible": $0.isVisible, "alpha": $0.alphaValue, "targetAlpha": $0.targetAlpha, "level": $0.level.rawValue, "frame": NSStringFromRect($0.frame)] }
-        ]
-        if let json = try? JSONSerialization.data(withJSONObject: data, options: [.prettyPrinted, .sortedKeys]) {
-            try? json.write(to: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("menu-veil-prototype-status.json"), options: .atomic)
+    private func applyGeometry(_ result: MenuMeasurement) {
+        let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+        guard let screen = NSScreen.screens.first(where: {
+            RuntimePolicy.belongsToDisplay(menu: result.frame, display: CGRect(x: $0.frame.minX, y: primaryTop - $0.frame.maxY, width: $0.frame.width, height: $0.frame.height))
+        }) else { invalidateGeometry(); return }
+        let height = max(screen.safeAreaInsets.top, NSStatusBar.system.thickness)
+        let frame = CGRect(x: screen.frame.minX, y: screen.frame.maxY - height,
+                           width: min(ceil(result.frame.maxX - screen.frame.minX + 6), screen.frame.width), height: height)
+        // Only cover the display whose menu bounds were actually measured. Never reuse a guessed width elsewhere.
+        if let panel = covers.first, panel.screen == screen {
+            if panel.frame != frame { panel.setFrame(frame, display: true); panel.contentView?.needsDisplay = true }
+        } else {
+            covers.forEach { $0.close() }; covers.removeAll()
+            let panel = CoverPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.title = "Menu Veil Cover"; panel.isReleasedWhenClosed = false
+            panel.isOpaque = true; panel.backgroundColor = .black; panel.hasShadow = false
+            panel.hidesOnDeactivate = false; panel.ignoresMouseEvents = true
+            panel.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.animationBehavior = .none; panel.alphaValue = 0
+            panel.contentView = WallpaperStrip(frame: CGRect(origin: .zero, size: frame.size), screen: screen, mode: mode)
+            covers = [panel]
         }
     }
-
-    func refreshMenu() {
-        toggleItem.state = enabled ? .on : .off
-        hoverItem.state = revealOnHover ? .on : .off
+    private func pointerChanged() {
+        guard installed, trusted, awake, enabled else { return }
+        let pointer = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(pointer) }
+        let display = screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+        if display != lastDisplay { lastDisplay = display; scheduleQuery() }
+        hovering = hoverEnabled && covers.contains { $0.frame.insetBy(dx: 0, dy: -3).contains(pointer) }
+        if hovering {
+            concealTask?.cancel(); concealTask = nil
+            revealUntil = Date().addingTimeInterval(0.55)
+        } else if Date() < revealUntil && concealTask == nil {
+            let work = DispatchWorkItem { [weak self] in self?.concealTask = nil; self?.refreshVisibility() }
+            concealTask = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + max(0.01, revealUntil.timeIntervalSinceNow), execute: work)
+        }
+        refreshVisibility()
     }
-    func menuWillOpen(_ menu: NSMenu) { menuOpen = true; tick() }
-    func menuDidClose(_ menu: NSMenu) { menuOpen = false; tick() }
-    @objc func toggle() { enabled.toggle(); refreshMenu(); tick() }
-    @objc func toggleHover() { revealOnHover.toggle(); refreshMenu(); tick() }
-    @objc func reveal() { revealUntil = Date().addingTimeInterval(10); tick() }
-    @objc func changeBackground(_ sender: NSMenuItem) { mode = sender.tag; rebuild() }
-    @objc func showSetup() {
-        if let setupWindow { setupWindow.makeKeyAndOrderFront(nil); return }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 250),
-                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "Menu Veil — Automatic sizing"
+    private func syncMouseMonitors() {
+        let needed = installed && trusted && awake && enabled
+        if !needed {
+            monitors.forEach { NSEvent.removeMonitor($0) }; monitors.removeAll(); hovering = false
+            return
+        }
+        guard monitors.isEmpty else { return }
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged]
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in self?.pointerChanged() }) { monitors.append(monitor) }
+        if let monitor = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in self?.pointerChanged(); return event }) { monitors.append(monitor) }
+    }
+    private func refreshVisibility() {
+        syncMouseMonitors()
+        let ready = RuntimePolicy.mayCover(installed: installed, trusted: trusted, enabled: enabled, awake: awake, measuredAt: measuredAt, now: Date())
+        let alpha: CGFloat = ready && !revealed ? 1 : 0
+        for panel in covers where panel.targetAlpha != alpha {
+            panel.targetAlpha = alpha
+            if alpha > 0 && !panel.isVisible { panel.orderFrontRegardless() }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : (alpha == 0 ? 0.2 : 0.32)
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                panel.animator().alphaValue = alpha
+            }
+        }
+        toggleItem?.state = enabled ? .on : .off
+        hoverItem?.state = hoverEnabled ? .on : .off
+        sizingItem?.title = !installed ? "Move to Applications first" : !trusted ? "Permission needed — open Setup" : !enabled ? "Paused" : measurement == nil ? "Waiting for the active app’s menus…" : "Automatic sizing · \(measurement!.count) menus"
+        if diagnosticMode { writeDiagnostics() }
+    }
+    private func writeDiagnostics() {
+        let state: [String: Any] = ["pid": ProcessInfo.processInfo.processIdentifier, "installed": installed, "accessibilityGranted": trusted,
+            "setupVisible": setupWindow?.isVisible ?? false, "mouseMonitors": monitors.count, "enabled": enabled, "awake": awake, "revealed": revealed, "menuCount": measurement?.count ?? 0,
+            "width": covers.first?.frame.width ?? 0,
+            "panels": covers.map { ["frame": NSStringFromRect($0.frame), "targetAlpha": $0.targetAlpha, "alpha": $0.alphaValue] }]
+        guard let data = try? JSONSerialization.data(withJSONObject: state, options: [.prettyPrinted, .sortedKeys]),
+              let string = String(data: data, encoding: .utf8), string != diagnosticState else { return }
+        diagnosticState = string
+        try? data.write(to: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("menu-veil-status.json"), options: .atomic)
+    }
+    func menuWillOpen(_ menu: NSMenu) { menuOpen = true; refreshVisibility() }
+    func menuDidClose(_ menu: NSMenu) { menuOpen = false; pointerChanged() }
+    @objc private func toggle() { enabled.toggle(); defaults.set(enabled, forKey: "enabled"); if enabled { scheduleQuery() } else { invalidateGeometry() }; refreshVisibility() }
+    @objc private func toggleHover() { hoverEnabled.toggle(); defaults.set(hoverEnabled, forKey: "hover"); hovering = false; pointerChanged() }
+    @objc private func reveal() { concealTask?.cancel(); concealTask = nil; revealUntil = Date().addingTimeInterval(10); pointerChanged() }
+    @objc private func changeBackground(_ item: NSMenuItem) { mode = item.tag; defaults.set(mode, forKey: "background"); invalidateGeometry(); scheduleQuery() }
+    @objc private func quit() { NSApp.terminate(nil) }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showSetup(); return true }
+    @objc private func showSetup() {
+        if let setupWindow { setupWindow.makeKeyAndOrderFront(nil); NSApp.activate(); refreshSetup(); return }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 640), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        window.title = "Menu Veil — Setup"
         window.isReleasedWhenClosed = false
-        let title = NSTextField(labelWithString: "Follow each app’s menus automatically")
-        title.font = .systemFont(ofSize: 19, weight: .semibold)
-        title.frame = NSRect(x: 28, y: 190, width: 430, height: 28)
-        let body = NSTextField(wrappingLabelWithString: "macOS requires Accessibility permission to read menu item positions. Menu Veil uses those bounds to fit the cover automatically as you switch apps. It does not capture your screen.\n\nEnable Menu Veil in Privacy & Security → Accessibility. Until then, the menus stay visible.")
-        body.frame = NSRect(x: 28, y: 64, width: 424, height: 118)
-        let button = NSButton(title: "Open Accessibility Settings…", target: self, action: #selector(openAccessibility))
-        button.bezelStyle = .rounded
-        button.frame = NSRect(x: 220, y: 20, width: 235, height: 32)
-        window.contentView?.addSubview(title)
-        window.contentView?.addSubview(body)
-        window.contentView?.addSubview(button)
-        window.center()
-        setupWindow = window
-        NSApp.activate()
-        window.makeKeyAndOrderFront(nil)
-    }
-    @objc func openAccessibility() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
+        let content = window.contentView!
+        let icon = NSImageView(image: NSImage(named: NSImage.applicationIconName) ?? NSImage())
+        icon.frame = NSRect(x: 30, y: 530, width: 72, height: 72); content.addSubview(icon)
+        let title = NSTextField(labelWithString: "A quieter menu bar.")
+        title.font = .systemFont(ofSize: 26, weight: .semibold)
+        title.frame = NSRect(x: 118, y: 548, width: 445, height: 40); content.addSubview(title)
+        func text(_ value: String, y: CGFloat, height: CGFloat, bold: Bool = false) {
+            let field = NSTextField(wrappingLabelWithString: value)
+            field.font = .systemFont(ofSize: bold ? 16 : 14, weight: bold ? .semibold : .regular)
+            field.frame = NSRect(x: 34, y: y, width: 532, height: height)
+            content.addSubview(field)
         }
+        text("1   Keep one copy in Applications", y: 480, height: 24, bold: true)
+        text("Install with Homebrew, or move Menu Veil into Applications before enabling permission. Open that same copy each time.", y: 428, height: 45)
+        text("2   Allow menu detection", y: 382, height: 24, bold: true)
+        text("Open Privacy & Security → \(permissionName) and enable Menu Veil. It reads menu positions; it doesn’t record your screen or send input to other apps.", y: 312, height: 60)
+        text("3   Hover to bring the menus back", y: 268, height: 24, bold: true)
+        text("Move over the top-left menu area to reveal it. Move away to hide it. The rectangle icon on the right has pause, background, and quit controls.", y: 200, height: 60)
+        let statusLabel = NSTextField(wrappingLabelWithString: "Checking setup…")
+        statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        statusLabel.frame = NSRect(x: 34, y: 132, width: 532, height: 56)
+        setupStatus = statusLabel; content.addSubview(statusLabel)
+        let permission = NSButton(title: "Open Permission Settings", target: self, action: #selector(openAccessibility))
+        permission.bezelStyle = .rounded; permission.frame = NSRect(x: 28, y: 80, width: 252, height: 34); content.addSubview(permission)
+        let done = NSButton(title: "Start using Menu Veil", target: self, action: #selector(finishSetup))
+        done.bezelStyle = .rounded; done.frame = NSRect(x: 300, y: 80, width: 270, height: 34); setupButton = done; content.addSubview(done)
+        let help = NSButton(title: "Permission is on but it still won’t work…", target: self, action: #selector(permissionHelp))
+        help.bezelStyle = .inline; help.frame = NSRect(x: 34, y: 34, width: 532, height: 28); content.addSubview(help)
+        setupWindow = window; refreshSetup(); window.center(); NSApp.activate(); window.makeKeyAndOrderFront(nil)
     }
-    @objc func quit() { NSApp.terminate(nil) }
+    private func refreshSetup() {
+        guard setupWindow != nil else { return }
+        setupButton?.isEnabled = installed && trusted
+        setupStatus?.stringValue = !installed ? "Move this app to /Applications or ~/Applications, then open it there. Permission requests are disabled here."
+            : !trusted ? "Waiting for permission. macOS may ask for Touch ID. If the toggle is already on, use the recovery steps below."
+            : !enabled ? "Permission is ready. Menu Veil is paused — enable Hide left menus from the rectangle icon."
+            : measurement == nil ? "Permission is ready. Switch to another app to detect its menus."
+            : "Ready — detected \(measurement!.count) menus. Try hovering over the top-left area."
+    }
+    @objc private func finishSetup() { defaults.set(true, forKey: "onboarded"); setupWindow?.close(); setupWindow = nil; setupStatus = nil; setupButton = nil }
+    @objc private func openAccessibility() {
+        guard installed else { NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory() + "/Applications")); return }
+        _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+    @objc private func permissionHelp() {
+        let alert = NSAlert()
+        alert.messageText = "Refresh the grant for this copy"
+        alert.informativeText = "In Privacy & Security → \(permissionName), remove old Menu Veil entries with the − button. Then use + to add this copy:\n\n\(Bundle.main.bundlePath)\n\nEnable it, quit Menu Veil, and open it again. macOS can retain an old grant after a development build or a signing change. Your menus stay visible while permission is unavailable."
+        alert.addButton(withTitle: "Show This App in Finder")
+        alert.addButton(withTitle: "Close")
+        if alert.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL]) }
+    }
     func applicationWillTerminate(_ notification: Notification) {
-        timer?.invalidate()
+        heartbeat?.invalidate(); concealTask?.cancel(); queryTask?.cancel()
+        for monitor in monitors { NSEvent.removeMonitor(monitor) }
+        if let reader { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(reader), .commonModes) }
         covers.forEach { $0.orderOut(nil) }
-        print("Menu Veil stopped; menus restored.")
-        fflush(stdout)
     }
 }
-
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
