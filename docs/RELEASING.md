@@ -15,7 +15,7 @@ set +a
 zsh scripts/release.sh
 ```
 
-The script tests the visibility safeguards, builds both CPU architectures, signs with hardened runtime and timestamp, submits to Apple, staples and validates the ticket, and checks Gatekeeper. It then creates `build/Menu-Veil-0.2.0.zip` and a cask with its exact SHA-256. A notarization failure stops the script; do not publish the archive anyway.
+The script tests the visibility safeguards, builds both CPU architectures, signs with hardened runtime and timestamp, submits to Apple, staples and validates the ticket, and checks Gatekeeper. It then creates `build/Menu-Veil-0.2.1.zip` and a cask with its exact SHA-256. A notarization failure stops the script; do not publish the archive anyway.
 
 The app has no automatic updater. Users receive updates through Homebrew or by replacing the app with a signed release.
 

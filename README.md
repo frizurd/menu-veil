@@ -59,6 +59,8 @@ Permission missing, app not installed yet, Mac asleep, or menu bounds unavailabl
 
 Opening another copy focuses the existing instance instead of creating another cover. Build-folder copies don't request permission, which helps avoid duplicate grants. Releases keep the same bundle ID and Developer ID signing identity; development builds can still need permission granted again after rebuilding.
 
+On app switches, the current cover stays visible while the new bounds are measured. Recent app widths are cached per display, and the same panel resizes in place. If the handoff cannot finish within half a second, the menus are revealed.
+
 The hover handler uses mouse events rather than a repeating 20 Hz timer. Mouse monitors are removed when paused, asleep, or waiting for permission. Wallpaper images are cached, and routine diagnostics are off. The app still does a low-frequency health check so it can recover when permission changes.
 
 ## Build from source

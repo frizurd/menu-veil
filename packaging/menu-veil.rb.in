@@ -1,5 +1,5 @@
 cask "menu-veil" do
-  version "0.2.0"
+  version "0.2.1"
   sha256 "@SHA256@"
 
   url "https://github.com/frizurd/menu-veil/releases/download/v#{version}/Menu-Veil-#{version}.zip"

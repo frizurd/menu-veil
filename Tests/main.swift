@@ -21,3 +21,6 @@ check(RuntimePolicy.acceptsResult(generation: 1, requestedGeneration: 1, pid: 42
 check(!RuntimePolicy.acceptsResult(generation: 2, requestedGeneration: 1, pid: 42, requestedPID: 42, trusted: true, awake: true, startedAt: now, now: now), "discard result after state change")
 check(!RuntimePolicy.acceptsResult(generation: 1, requestedGeneration: 1, pid: 43, requestedPID: 42, trusted: true, awake: true, startedAt: now, now: now), "discard previous app result")
 check(!RuntimePolicy.acceptsResult(generation: 1, requestedGeneration: 1, pid: 42, requestedPID: 42, trusted: true, awake: true, startedAt: now.addingTimeInterval(-2), now: now), "discard slow or hung app result")
+check(RuntimePolicy.mayCover(installed: true, trusted: true, enabled: true, awake: true, measuredAt: now, now: now, switchingUntil: now.addingTimeInterval(0.5)), "retain fresh cover during app handoff")
+check(!RuntimePolicy.mayCover(installed: true, trusted: true, enabled: true, awake: true, measuredAt: now, now: now, switchingUntil: now.addingTimeInterval(-0.1)), "failed handoff expires even with fresh previous geometry")
+check(!RuntimePolicy.mayCover(installed: true, trusted: false, enabled: true, awake: true, measuredAt: now, now: now, switchingUntil: now.addingTimeInterval(0.5)), "handoff never overrides revoked permission")

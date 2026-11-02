@@ -11,6 +11,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check visibility and geometry safeguards
         run: zsh scripts/test.sh
+      - name: Check native app-switch continuity
+        run: zsh scripts/test-app-switch.sh
       - name: Build development app (Apple silicon and Intel)
         run: zsh build.sh
       - name: Verify app bundle

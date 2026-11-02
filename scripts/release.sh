@@ -7,7 +7,7 @@ cd "${0:A:h}/.."
 zsh scripts/test.sh
 zsh build.sh
 app="$PWD/build/Menu Veil.app"
-archive="$PWD/build/Menu-Veil-0.2.0.zip"
+archive="$PWD/build/Menu-Veil-0.2.1.zip"
 ditto -c -k --keepParent "$app" "$archive"
 xcrun notarytool submit "$archive" --keychain-profile "$MENU_VEIL_NOTARY_PROFILE" --wait
 xcrun stapler staple "$app"
