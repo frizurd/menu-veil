@@ -1,40 +1,42 @@
 # Menu Veil
 
-Hide the left side of your Mac's menu bar. Hover over it when you need it.
+<img src="Assets/MenuVeil.png" width="96" alt="Menu Veil icon">
 
-I wanted the Apple icon and the File, Edit, View menus out of the way, while keeping the status icons on the right. macOS only lets you hide the whole bar, so this app covers the left part.
+I wanted to hide the Apple icon and all the File, Edit, View stuff on the left, but keep the icons on the right. Couldn't find a macOS setting for that. So here's a small app that does it with a cover.
 
-The cover fits the active app's menus automatically. No width slider. Switch apps and it measures again. Hover over the menu area and the cover fades away; move away and it fades back.
+Hover over the left side and the menus fade back in. Move away and they're hidden again. The width follows whichever app you're using, so there's nothing to adjust manually.
 
-![Menu Veil first-launch setup](docs/setup.png)
+![Desktop demo with the left menus hidden](docs/demo.png)
 
-## Try it
+This is an illustrated demo. Open `docs/demo.html` in a browser if you want to try the hover effect.
 
-You'll need a Mac with the Xcode command line tools installed. Build it with:
+## Run it
+
+You'll need Xcode's command line tools. From the project folder:
 
 ```sh
 zsh build.sh
 open "build/Menu Veil.app"
 ```
 
-On first launch, enable Menu Veil in System Settings → Privacy & Security → Accessibility. It needs that permission to read the menu positions. Until you allow it, the menus stay visible.
+macOS will need you to allow Accessibility access for Menu Veil. Go to System Settings → Privacy & Security → Accessibility and turn it on there. The app reads the menu positions with that permission. It leaves the menus visible until access is allowed.
 
-There's a small rectangle icon on the right side of the menu bar. Use it to pause the cover, change its background, reveal the menus for ten seconds, or quit. Nothing starts at login.
+Once it's running, look for the little rectangle icon on the right. That's where you can pause it, pick a background, show the menus for ten seconds, or quit. It doesn't add itself to your login items.
 
-## How it works
+## A few details
 
-It's a Swift/AppKit app with a window that sits over the menu bar and lets clicks pass through. It reads the active app's menu bounds through Accessibility, including the Apple menu and disabled headings. It checks again every 0.4 seconds and when you switch apps.
+The app is written in Swift with AppKit. The cover is a window above the menu bar. Clicks go through it to the real menus underneath.
 
-Hover fades the cover out in 0.2 seconds. After you leave for about half a second, it fades back over 0.32 seconds. It stays out of the way while a menu is open. Reduce Motion turns the fades off.
+It measures the menu headings every 0.4 seconds and when you switch apps. That includes the Apple menu and greyed-out headings. The hover fade takes 0.2 seconds; hiding waits about half a second, then fades over 0.32 seconds. Opening a menu keeps it revealed. If you have Reduce Motion on, the fades are off.
 
-The background comes from your wallpaper image. No screen recording, network calls, or third-party dependencies.
+For the cover background, it reads your wallpaper image. It doesn't record the screen or make network requests. There are no third-party dependencies.
 
-## Still a prototype
+## Things that still need work
 
-Tested on macOS 27.0.1, on one display. Other versions haven't been checked.
+I've only tried this on macOS 27.0.1 with one display. It works there, but I haven't checked older versions.
 
-This covers the menus visually. It doesn't remove them or make more room for status icons. Animated wallpapers and menu-bar tint can leave a visible seam. There are solid background options if the wallpaper doesn't match.
+The menus are still underneath the cover, so you won't get extra room for status icons. And the background won't always match perfectly: animated wallpapers and the menu bar's tint can leave a seam. You can pick a solid background instead.
 
-Mixed display sizes and full-screen apps still need testing. The measured width is reused on other displays, so those may need more work. Settings reset when you restart the app.
+Multiple displays and full-screen apps need more testing. Right now it reuses the same measured width on other displays. Settings also reset when you restart it.
 
-Quitting removes the cover straight away. If you want to remove its permission too, turn Menu Veil off in Accessibility settings.
+To stop it, quit from the rectangle icon. The cover disappears straight away. You can turn its Accessibility permission back off in System Settings too.
