@@ -12,11 +12,20 @@ This is an illustrated demo. Open `docs/demo.html` in a browser if you want to t
 
 ## Install
 
-The first notarized release and Homebrew tap are being prepared. The command below is **not live yet**; it will be enabled when v0.2.0 is published:
+Install with Homebrew:
 
 ```sh
 brew install --cask frizurd/tap/menu-veil
 ```
+
+Homebrew 7 or newer requires you to trust a third-party cask first. Run these once, then run the install command above:
+
+```sh
+brew tap frizurd/tap
+brew trust --cask frizurd/tap/menu-veil
+```
+
+Or [download the notarized app](https://github.com/frizurd/menu-veil/releases/latest), unzip it, and move it into Applications. Apple silicon and Intel are both included.
 
 Then open Menu Veil from Applications. The setup window walks you through three things: keep one installed copy, allow menu detection, and try hovering over the left menus.
 

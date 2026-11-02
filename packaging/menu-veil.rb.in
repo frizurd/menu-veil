@@ -7,7 +7,7 @@ cask "menu-veil" do
   desc "Hide left-side menu bar menus and reveal them on hover"
   homepage "https://github.com/frizurd/menu-veil"
 
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
 
   app "Menu Veil.app"
 
